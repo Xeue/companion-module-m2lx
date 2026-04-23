@@ -1,6 +1,6 @@
 {
-	"id": "sony-m2lx",
-	"name": "sony-m2lx",
+	"id": "companion-module-m2lx",
+	"name": "companion-module-m2lx",
 	"shortname": "m2lx",
 	"description": "Driver for Sony M2LX cloud mixer",
 	"version": "0.0.0",
