@@ -1,7 +1,21 @@
-import { LogLevel } from '@companion-module/base'
+import { InstanceStatus, LogLevel } from '@companion-module/base'
 import { ModuleConfig } from './config.js'
-import { WebSocket } from 'ws'
+import { WebSocket, type RawData } from 'ws'
 import EventEmitter from 'events'
+import https from 'node:https'
+
+const RECONNECT_DELAY_MS = 5000
+const HEARTBEAT_INTERVAL_MS = 30_000
+const TOKEN_REFRESH_LEAD_MS = 60_000
+const REST_POLL_INTERVAL_MS = 5000
+const REST_SLOW_POLL_INTERVAL_MS = 60_000
+
+function decodeFrame(data: RawData): string {
+	if (typeof data === 'string') return data
+	if (Buffer.isBuffer(data)) return data.toString('utf8')
+	if (Array.isArray(data)) return Buffer.concat(data).toString('utf8')
+	return Buffer.from(data).toString('utf8')
+}
 
 type payload = {
 	status: element[]
@@ -74,6 +88,83 @@ type m2lxauthResponse = {
 	roledIds: string[]
 }
 
+type m2lxTokenResponse = {
+	access_token: string
+	refresh_token?: string
+	expires_in: number
+}
+
+export type StatusCallback = (status: InstanceStatus, message?: string | null) => void
+
+export type EventOverviewEntry = {
+	event_id: string
+	event_name: string
+	event_type?: string
+	status: string
+	endpoint?: unknown
+}
+
+export type OutputConfigEntry = {
+	id: number
+	status: string
+	name?: string
+	type?: string
+	nickname?: string
+}
+
+export type TallyEnable = {
+	program_source?: string
+	preview_source?: string
+	clean_source?: string
+}
+
+export type OperationMode = {
+	flip_flop?: boolean
+}
+
+export type VersionInfo = {
+	m2lx?: string
+	m2lx_frontend?: string
+	m2lx_backend?: string
+	[k: string]: unknown
+}
+
+export type CertInfo = {
+	expiry?: string
+	[k: string]: unknown
+}
+
+export type ResourceStatus = {
+	cpu_utilization?: number
+	gpu_utilization?: number
+	cpu_load_average_1min?: number
+	cpu_load_average_5min?: number
+	cpu_load_average_15min?: number
+	gpu_dec?: number
+	gpu_enc?: number
+}
+
+export type SwitcherInputEntry = {
+	id: number
+	source: string
+	signal: string
+	status: string
+}
+
+export type RouterInputEntry = {
+	id: number
+	status: string
+	name?: string
+	[k: string]: unknown
+}
+
+export type MicInputEntry = {
+	id: number
+	status?: string
+	name?: string
+	[k: string]: unknown
+}
+
 type m2lxContextMap = {
 	[key: string]: string
 }
@@ -86,12 +177,11 @@ export class M2LX extends EventEmitter {
 	statusOpen: boolean
 	statusError: Error | undefined
 	controlError: Error | undefined
-	checkError: Event | undefined
-	checkDetError: Event | undefined
 	controlCloseStatus: number
 	statusCloseStatus: number
 	trans_running: boolean
 	log: (level: LogLevel, message: string) => void
+	updateStatus: StatusCallback
 	contextMap: m2lxContextMap
 	switcherStatus: {
 		program: {
@@ -109,8 +199,31 @@ export class M2LX extends EventEmitter {
 		program: string
 		preview: string
 	}
+	private accessToken: string | undefined
+	private refreshToken: string | undefined
+	private reconnectTimer: NodeJS.Timeout | undefined
+	private refreshTimer: NodeJS.Timeout | undefined
+	private heartbeatTimer: NodeJS.Timeout | undefined
+	private heartbeatAlive: boolean
+	private shuttingDown: boolean
+	private starting: boolean
+	private fastPollTimer: NodeJS.Timeout | undefined
+	private slowPollTimer: NodeJS.Timeout | undefined
+	currentEventId: string | undefined
+	rest: {
+		events: EventOverviewEntry[]
+		outputs: OutputConfigEntry[]
+		tally: TallyEnable
+		operationMode: OperationMode
+		version: VersionInfo
+		certExpiryDays: number | undefined
+		resource: ResourceStatus
+		switcherInputs: SwitcherInputEntry[]
+		routerInputs: RouterInputEntry[]
+		micInputs: MicInputEntry[]
+	}
 
-	constructor(config: ModuleConfig, log: (level: LogLevel, message: string) => void) {
+	constructor(config: ModuleConfig, log: (level: LogLevel, message: string) => void, updateStatus: StatusCallback) {
 		super()
 		this.config = config
 		this.controlOpen = false
@@ -129,177 +242,491 @@ export class M2LX extends EventEmitter {
 			program: 'program',
 			preview: 'preview',
 		}
+		this.heartbeatAlive = false
+		this.shuttingDown = false
+		this.starting = false
 		this.log = log
+		this.updateStatus = updateStatus
+		this.rest = {
+			events: [],
+			outputs: [],
+			tally: {},
+			operationMode: {},
+			version: {},
+			certExpiryDays: undefined,
+			resource: {},
+			switcherInputs: [],
+			routerInputs: [],
+			micInputs: [],
+		}
+	}
+
+	private get allowSelfSigned(): boolean {
+		return this.config.allowSelfSigned !== false
+	}
+
+	stop(): void {
+		this.shuttingDown = true
+		this.clearReconnect()
+		this.clearRefresh()
+		this.clearHeartbeat()
+		this.clearPolling()
+		if (this.controlWS) {
+			this.controlWS.removeAllListeners()
+			this.controlWS.close()
+			this.controlWS = undefined
+		}
+		if (this.statusWS) {
+			this.statusWS.removeAllListeners()
+			this.statusWS.close()
+			this.statusWS = undefined
+		}
+		this.controlOpen = false
+		this.statusOpen = false
+	}
+
+	private clearPolling(): void {
+		if (this.fastPollTimer) {
+			clearInterval(this.fastPollTimer)
+			this.fastPollTimer = undefined
+		}
+		if (this.slowPollTimer) {
+			clearInterval(this.slowPollTimer)
+			this.slowPollTimer = undefined
+		}
+	}
+
+	private clearReconnect(): void {
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer)
+			this.reconnectTimer = undefined
+		}
+	}
+
+	private clearRefresh(): void {
+		if (this.refreshTimer) {
+			clearTimeout(this.refreshTimer)
+			this.refreshTimer = undefined
+		}
+	}
+
+	private clearHeartbeat(): void {
+		if (this.heartbeatTimer) {
+			clearInterval(this.heartbeatTimer)
+			this.heartbeatTimer = undefined
+		}
+	}
+
+	private scheduleReconnect(reason: string): void {
+		if (this.shuttingDown) return
+		if (this.reconnectTimer) return
+		this.log('info', `scheduling reconnect (${reason}) in ${RECONNECT_DELAY_MS}ms`)
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = undefined
+			void this.start()
+		}, RECONNECT_DELAY_MS)
+	}
+
+	private updateConnectionStatus(): void {
+		if (this.shuttingDown) return
+		if (this.controlOpen && this.statusOpen) {
+			this.updateStatus(InstanceStatus.Ok)
+		} else if (this.controlOpen || this.statusOpen) {
+			this.updateStatus(InstanceStatus.UnknownWarning, 'only one socket open')
+		} else {
+			this.updateStatus(InstanceStatus.ConnectionFailure, 'disconnected')
+		}
+		this.emit('feedback-connection')
 	}
 
 	async start(): Promise<void> {
-		let connecting = false
-		if (this.controlWS !== undefined) {
-			if (this.controlWS.readyState == 0) {
-				connecting = true
-			}
-		}
-		if (this.statusWS !== undefined) {
-			if (this.statusWS.readyState == 0) {
-				connecting = true
-			}
-		}
-		if (connecting) {
-			return
-		}
-
-		if (this.controlOpen) {
-			if (this.controlWS !== undefined) {
-				//$SD.api.logMessage('Connect: controlWS.close()' + csp.controlOpen); // 確認用に今回だけログに出す
-				this.log('info', `Connect: controlWS.close() ${this.controlOpen}`)
-				this.controlWS.close()
-			} else {
-				this.controlOpen = false
-				this.log('info', `Connect: controlOpen = false' ${this.controlOpen}`)
-			}
-		}
-
-		if (this.statusOpen) {
-			if (this.statusWS !== undefined) {
-				//$SD.api.logMessage('Connect: statusWS.close()' + csp.statusOpen); // 確認用に今回だけログに出す
-				this.log('info', `Connect: statusWS.close() ${this.statusOpen}`)
-				this.statusWS.close()
-			} else {
-				this.statusOpen = false
-				this.log('info', `Connect: statusOpen = false ${this.statusOpen}, ${this.statusWS}`)
-			}
-		}
-
-		if (this.controlOpen || this.statusOpen) {
-			return
-		}
+		if (this.shuttingDown) return
+		if (this.starting) return
+		if (this.controlOpen || this.statusOpen) return
+		this.clearReconnect()
+		this.starting = true
+		this.updateStatus(InstanceStatus.Connecting)
 
 		this.switcherStatus.program = {}
 		this.switcherStatus.preview = {}
 		this.switcherStatus.snapshots = []
 		this.switcherStatus.keyStatus = {}
 
-		// let basicAuth = btoa(`${this.config.user}:${this.config.pass}`);
-
 		this.log('info', 'Connecting to M2L-X...')
 
-		const response = await fetch(`https://${this.config.host}/api/local_auth/signin`, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify({
-				alias: this.config.user,
-				password: this.config.pass,
-			}),
-		})
-		const data = (await response.json()) as m2lxauthResponse
+		let authData: m2lxauthResponse
+		try {
+			authData = await this.signin()
+		} catch (err) {
+			const e = err as Error
+			this.log('error', `signin failed: ${e.message}`)
+			if (/401|403/.test(e.message)) {
+				this.updateStatus(InstanceStatus.AuthenticationFailure, e.message)
+			} else {
+				this.updateStatus(InstanceStatus.ConnectionFailure, e.message)
+			}
+			this.starting = false
+			this.scheduleReconnect('signin failed')
+			return
+		}
 
-		const token = data.access_token
+		this.accessToken = authData.access_token
+		this.refreshToken = authData.refresh_token
+		this.scheduleTokenRefresh(authData.expires_in)
 
-		process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
-		const controlUrl = `wss://${this.config.host}/api/v1/switcher_controller?access_token=${token}`
-		const statusUrl = `wss://${this.config.host}/api/v1/switcher_status?nodes=mixer,router&access_token=${token}`
+		// Resolve event_id. If config didn't set one, pick the first Running event.
+		await this.resolveEventId()
 
-		this.log('info', controlUrl)
-		this.log('info', statusUrl)
-		this.controlWS = new WebSocket(controlUrl, 'json')
-		this.controlWS.on('error', (error) => {
+		const controlUrl = `wss://${this.config.host}/api/v1/switcher_controller?access_token=${this.accessToken}`
+		const statusUrl = `wss://${this.config.host}/api/v1/switcher_status?nodes=mixer,router&access_token=${this.accessToken}`
+
+		this.controlWS = new WebSocket(controlUrl, 'json', { rejectUnauthorized: this.allowSelfSigned ? false : true })
+		this.attachControlHandlers(this.controlWS)
+
+		this.statusWS = new WebSocket(statusUrl, 'json', { rejectUnauthorized: this.allowSelfSigned ? false : true })
+		this.attachStatusHandlers(this.statusWS)
+
+		this.startRestPolling()
+		this.starting = false
+	}
+
+	private async resolveEventId(): Promise<void> {
+		const configured = this.config.event_id?.trim()
+		try {
+			const overview = await this.restGet<EventOverviewEntry[]>('/api/events/overview')
+			this.rest.events = overview
+			if (configured) {
+				const match = overview.find((e) => e.event_id === configured)
+				this.currentEventId = match ? configured : configured
+				if (!match) this.log('warn', `event_id "${configured}" not found in overview; using it anyway`)
+			} else {
+				const running = overview.find((e) => e.status === 'Running')
+				this.currentEventId = running?.event_id ?? overview[0]?.event_id
+				if (!this.currentEventId) this.log('warn', 'no events available from /api/events/overview')
+				else this.log('info', `auto-selected event_id=${this.currentEventId} (status=${running ? 'Running' : 'first'})`)
+			}
+		} catch (err) {
+			this.log('warn', `event overview failed: ${(err as Error).message}`)
+			this.currentEventId = configured || undefined
+		}
+	}
+
+	private startRestPolling(): void {
+		this.clearPolling()
+		this.fastPollTimer = setInterval(() => void this.fastPoll(), REST_POLL_INTERVAL_MS)
+		this.slowPollTimer = setInterval(() => void this.slowPoll(), REST_SLOW_POLL_INTERVAL_MS)
+		// immediate tick on both
+		void this.fastPoll()
+		void this.slowPoll()
+	}
+
+	private async fastPoll(): Promise<void> {
+		if (this.shuttingDown || !this.accessToken) return
+		try {
+			this.rest.events = await this.restGet<EventOverviewEntry[]>('/api/events/overview')
+		} catch (err) {
+			this.log('debug', `events/overview poll failed: ${(err as Error).message}`)
+		}
+		if (!this.currentEventId) return
+		const eid = encodeURIComponent(this.currentEventId)
+		try {
+			this.rest.outputs = await this.restGet<OutputConfigEntry[]>(`/api/output/list/${eid}`)
+		} catch (err) {
+			this.log('debug', `output/list poll failed: ${(err as Error).message}`)
+		}
+		try {
+			this.rest.tally = await this.restGet<TallyEnable>(`/api/tally/enable/${eid}`)
+		} catch (err) {
+			this.log('debug', `tally/enable poll failed: ${(err as Error).message}`)
+		}
+		try {
+			this.rest.operationMode = await this.restGet<OperationMode>(`/api/events/operation_mode/${eid}`)
+		} catch (err) {
+			this.log('debug', `operation_mode poll failed: ${(err as Error).message}`)
+		}
+		try {
+			this.rest.switcherInputs = await this.restGet<SwitcherInputEntry[]>(`/api/input/switcher/list/${eid}`)
+		} catch (err) {
+			this.log('debug', `input/switcher/list poll failed: ${(err as Error).message}`)
+		}
+		try {
+			this.rest.routerInputs = await this.restGet<RouterInputEntry[]>(`/api/input/router/list/${eid}`)
+		} catch (err) {
+			this.log('debug', `input/router/list poll failed: ${(err as Error).message}`)
+		}
+		try {
+			this.rest.micInputs = await this.restGet<MicInputEntry[]>(`/api/input/mic/list/${eid}`)
+		} catch (err) {
+			this.log('debug', `input/mic/list poll failed: ${(err as Error).message}`)
+		}
+		this.emit('feedback-rest')
+	}
+
+	private async slowPoll(): Promise<void> {
+		if (this.shuttingDown || !this.accessToken) return
+		try {
+			this.rest.version = await this.restGet<VersionInfo>('/api/version/list')
+		} catch (err) {
+			this.log('debug', `version/list poll failed: ${(err as Error).message}`)
+		}
+		try {
+			const cert = await this.restGet<CertInfo>('/api/cert/expiry')
+			if (cert.expiry) {
+				const days = Math.max(0, Math.round((new Date(cert.expiry).getTime() - Date.now()) / 86_400_000))
+				this.rest.certExpiryDays = Number.isFinite(days) ? days : undefined
+			}
+		} catch (err) {
+			this.log('debug', `cert/expiry poll failed: ${(err as Error).message}`)
+		}
+		try {
+			this.rest.resource = await this.restGet<ResourceStatus>('/api/system/resource_status')
+		} catch (err) {
+			this.log('debug', `resource_status poll failed: ${(err as Error).message}`)
+		}
+		this.emit('feedback-rest-slow')
+	}
+
+	async restGet<T>(path: string): Promise<T> {
+		return this.httpsJson<T>('GET', path)
+	}
+
+	async restPost<T = unknown>(path: string, body: unknown = null): Promise<T> {
+		return this.httpsJson<T>('POST', path, body)
+	}
+
+	private attachControlHandlers(ws: WebSocket): void {
+		ws.on('error', (error) => {
 			if (this.controlError == null) {
-				//this.log('info', 'WebSocket (control) error: ', event);
 				this.log('error', `WebSocket (control) error: ${error.message}`)
-				// $SD.api.logMessage('WebSocket (control) error / status:      / URL:' + csp.host);
 			}
 			this.controlError = error
-			// DO FEEDBACK
 			this.refreshAllStates()
 		})
 
-		this.controlWS.on('close', (code) => {
+		ws.on('close', (code) => {
 			if (this.controlCloseStatus != code) {
-				//this.log('info', 'WebSocket (control) close: ', event, event.code);
 				this.log('warn', `WebSocket (control) close: ${code}`)
-				// $SD.api.logMessage('WebSocket (control) close / status: ' + event.code + ' / URL:' + csp.host);
 			}
 			this.controlOpen = false
 			this.controlCloseStatus = code
 			this.controlWS = undefined
-			// DO FEEDBACK
 			this.refreshAllStates()
+			this.updateConnectionStatus()
+			if (!this.statusOpen) this.scheduleReconnect('control closed')
 		})
 
-		this.controlWS.on('open', () => {
+		ws.on('open', () => {
 			this.log('info', `WebSocket (control) open: ${this.config.host}`)
-			// $SD.api.logMessage('WebSocket (control) open  / status:      / URL:' + csp.host);
 			this.controlOpen = true
 			this.controlError = undefined
-			if (this.controlError === null && this.statusError === null) {
-				this.checkError = undefined
-				this.checkDetError = undefined
-			}
-			// 先に Status API が open した場合はここでボタンの更新を行う
-			// DO FEEDBACK
 			this.refreshAllStates()
+			this.updateConnectionStatus()
 		})
 
-		this.controlWS.on('message', (data) => {
+		ws.on('message', (data) => {
 			this.controlError = undefined
-			const jsonObj = JSON.parse(JSON.stringify(data))
+			let jsonObj: any
+			try {
+				jsonObj = JSON.parse(decodeFrame(data))
+			} catch (err) {
+				this.log('warn', `control message parse error: ${(err as Error).message}`)
+				return
+			}
 			if (jsonObj.code !== 200) {
-				const match = jsonObj.message.match(/Invalid request: invalid source name '(.*)'/)
+				const match = jsonObj.message?.match?.(/Invalid request: invalid source name '(.*)'/)
 				if (match && match.length == 2) {
 					const input = match[1]
-					const jsonObj: any = Object.values(this.contextMap).find(
-						(jsonObj: any) =>
-							jsonObj.payload && jsonObj.payload.settings && jsonObj.payload.settings.mixer_input === input,
+					const ctx: any = Object.values(this.contextMap).find(
+						(c: any) => c.payload && c.payload.settings && c.payload.settings.mixer_input === input,
 					)
-					if (jsonObj) {
-						// $SD.api.showAlert(jsonObj.context);
-						this.log('info', jsonObj.context)
+					if (ctx) {
+						this.log('info', ctx.context)
 					}
 				}
 			}
 		})
+	}
 
-		this.statusWS = new WebSocket(statusUrl, 'json')
-		this.statusWS.on('error', (error) => {
+	private attachStatusHandlers(ws: WebSocket): void {
+		ws.on('error', (error) => {
 			if (this.statusError == null) {
-				//this.log('info', 'WebSocket (status) error: ', event);
 				this.log('error', `WebSocket (status) error: ${error.message}`)
-				// $SD.api.logMessage('WebSocket (status ) error / status:      / URL:' + csp.host);
 			}
 			this.statusError = error
-			// DO FEEDBACK
 			this.refreshAllStates()
 		})
 
-		this.statusWS.on('close', (code) => {
+		ws.on('close', (code) => {
 			if (this.statusCloseStatus != code) {
-				//this.log('info', 'WebSocket (status) close: ', event);
 				this.log('warn', `WebSocket (status) close: ${code}`)
-				// $SD.api.logMessage('WebSocket (status ) close / status: ' + event.code + ' / URL:' + csp.host);
 			}
 			this.statusOpen = false
 			this.statusCloseStatus = code
 			this.statusWS = undefined
-			// DO FEEDBACK
+			this.clearHeartbeat()
 			this.refreshAllStates()
+			this.updateConnectionStatus()
+			if (!this.controlOpen) this.scheduleReconnect('status closed')
 		})
 
-		this.statusWS.on('open', () => {
+		ws.on('open', () => {
 			this.log('info', `WebSocket (status) open: ${this.config.host}`)
-			// $SD.api.logMessage('WebSocket (status ) open  / status:      / URL:' + csp.host);
 			this.statusOpen = true
 			this.statusError = undefined
-			if (this.controlError === null && this.statusError === null) {
-				this.checkError = undefined
-				this.checkDetError = undefined
-			}
+			this.startHeartbeat(ws)
+			this.updateConnectionStatus()
 		})
 
-		this.statusWS.on('message', (data) => {
-			this.onStatusUpdate(JSON.parse(JSON.stringify(data)))
+		ws.on('pong', () => {
+			this.heartbeatAlive = true
+		})
+
+		ws.on('message', (data) => {
+			let parsed: payload
+			try {
+				parsed = JSON.parse(decodeFrame(data)) as payload
+			} catch (err) {
+				this.log('warn', `status message parse error: ${(err as Error).message}`)
+				return
+			}
+			this.onStatusUpdate(parsed)
 			this.statusError = undefined
+		})
+	}
+
+	private startHeartbeat(ws: WebSocket): void {
+		this.clearHeartbeat()
+		this.heartbeatAlive = true
+		this.heartbeatTimer = setInterval(() => {
+			if (!this.heartbeatAlive) {
+				this.log('warn', 'heartbeat timeout; terminating status socket')
+				ws.terminate()
+				return
+			}
+			this.heartbeatAlive = false
+			try {
+				ws.ping()
+			} catch {
+				// socket already closing
+			}
+		}, HEARTBEAT_INTERVAL_MS)
+	}
+
+	private scheduleTokenRefresh(expiresInSeconds: number): void {
+		this.clearRefresh()
+		const delayMs = Math.max(5_000, expiresInSeconds * 1000 - TOKEN_REFRESH_LEAD_MS)
+		this.refreshTimer = setTimeout(() => {
+			void this.refreshAccessToken()
+		}, delayMs)
+	}
+
+	private async refreshAccessToken(): Promise<void> {
+		if (this.shuttingDown) return
+		if (!this.refreshToken || !this.accessToken) {
+			this.log('warn', 'no refresh token available; forcing reconnect')
+			this.forceReconnect('missing refresh token')
+			return
+		}
+		try {
+			const res = await this.refreshTokenCall(this.refreshToken, this.accessToken)
+			this.accessToken = res.access_token
+			if (res.refresh_token) this.refreshToken = res.refresh_token
+			this.scheduleTokenRefresh(res.expires_in)
+			this.log('info', 'access token refreshed')
+		} catch (err) {
+			const e = err as Error
+			this.log('warn', `token refresh failed: ${e.message}`)
+			this.forceReconnect('token refresh failed')
+		}
+	}
+
+	private forceReconnect(reason: string): void {
+		if (this.controlWS) {
+			try {
+				this.controlWS.close()
+			} catch {
+				/* noop */
+			}
+		}
+		if (this.statusWS) {
+			try {
+				this.statusWS.close()
+			} catch {
+				/* noop */
+			}
+		}
+		this.scheduleReconnect(reason)
+	}
+
+	private async signin(): Promise<m2lxauthResponse> {
+		return this.httpsJson<m2lxauthResponse>(
+			'POST',
+			'/api/local_auth/signin',
+			{ alias: this.config.user, password: this.config.pass },
+			{ auth: false },
+		)
+	}
+
+	private async refreshTokenCall(refreshToken: string, accessToken: string): Promise<m2lxTokenResponse> {
+		return this.httpsJson<m2lxTokenResponse>(
+			'POST',
+			'/api/local_auth/refresh_token',
+			{ refresh_token: refreshToken },
+			{ auth: false, headers: { Authorization: `Bearer ${accessToken}` } },
+		)
+	}
+
+	private async httpsJson<T>(
+		method: 'GET' | 'POST',
+		path: string,
+		body: unknown = null,
+		opts: { auth?: boolean; headers?: Record<string, string> } = {},
+	): Promise<T> {
+		const useAuth = opts.auth !== false
+		const headers: Record<string, string> = { ...(opts.headers ?? {}) }
+		let bodyBuf: Buffer | undefined
+		if (body !== null && body !== undefined) {
+			bodyBuf = Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8')
+			headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
+			headers['Content-Length'] = String(bodyBuf.byteLength)
+		}
+		if (useAuth && this.accessToken && !headers.Authorization) {
+			headers.Authorization = `Bearer ${this.accessToken}`
+		}
+		return new Promise<T>((resolve, reject) => {
+			const req = https.request(
+				{
+					host: this.config.host,
+					port: 443,
+					path,
+					method,
+					headers,
+					rejectUnauthorized: !this.allowSelfSigned,
+				},
+				(res) => {
+					const chunks: Buffer[] = []
+					res.on('data', (c: Buffer) => chunks.push(c))
+					res.on('end', () => {
+						const text = Buffer.concat(chunks).toString('utf8')
+						if (res.statusCode && res.statusCode >= 400) {
+							reject(new Error(`${method} ${path} ${res.statusCode}: ${text}`))
+							return
+						}
+						if (!text) {
+							resolve(undefined as T)
+							return
+						}
+						try {
+							resolve(JSON.parse(text) as T)
+						} catch (err) {
+							reject(err as Error)
+						}
+					})
+				},
+			)
+			req.on('error', reject)
+			if (bodyBuf) req.write(bodyBuf)
+			req.end()
 		})
 	}
 
@@ -464,7 +891,10 @@ export class M2LX extends EventEmitter {
 							? element.state.transition.progress
 							: null
 				if (trans_progress !== null && is_trans_progress !== null) {
-					this.trans_running = is_trans_progress
+					if (this.trans_running !== is_trans_progress) {
+						this.trans_running = is_trans_progress
+						this.emit('feedback-transition')
+					}
 				}
 			}
 		})

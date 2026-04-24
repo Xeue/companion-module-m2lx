@@ -1,0 +1,11 @@
+{
+	"permissions": {
+		"allow": [
+			"Bash(node -e \"const d=require\\('c:/Users/samsw/GitProjects/companion-module-dev/companion-module-sony-m2lx/openapi.json'\\); console.log\\(JSON.stringify\\(d.components.schemas.ResourceResponseModel, null, 2\\)\\);\")",
+			"Bash(git -C \"c:/Users/samsw/GitProjects/companion-module-dev/companion-module-sony-m2lx\" diff --stat HEAD)",
+			"Bash(git -C \"c:/Users/samsw/GitProjects/companion-module-dev/companion-module-sony-m2lx\" status --short)",
+			"Bash(node -e ' *)",
+			"Bash(node -e \"const fs=require\\('fs'\\); const d=JSON.parse\\(fs.readFileSync\\('openapi.json','utf8'\\)\\); console.log\\('=== SwitcherInput ==='\\); console.log\\(JSON.stringify\\(d.components.schemas.SwitcherInput, null, 2\\)\\); console.log\\('=== RouterInputConfig ==='\\); console.log\\(JSON.stringify\\(d.components.schemas.RouterInputConfig, null, 2\\)\\);\")"
+		]
+	}
+}
