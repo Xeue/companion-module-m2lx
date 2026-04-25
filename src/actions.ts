@@ -1,4 +1,5 @@
 import type { ModuleInstance } from './main.js'
+import type { M2LX } from './m2lx.js'
 
 const KEY_TYPE_CHOICES = [
 	{ id: 'downstream', label: 'DSK (Downstream)' },
@@ -17,6 +18,42 @@ const IDENTITY_SHAPE = {
 		{ position: [1, 1], tex_coord: [1, 1] },
 		{ position: [0, 1], tex_coord: [0, 1] },
 	],
+}
+
+// Named effects the mixer understands in configure_effect.name.
+const WIPE_PATTERN_CHOICES = [
+	{ id: 'wipe_right', label: 'Wipe Right' },
+	{ id: 'wipe_left', label: 'Wipe Left' },
+	{ id: 'wipe_up', label: 'Wipe Up' },
+	{ id: 'wipe_down', label: 'Wipe Down' },
+	{ id: 'wipe_up_right', label: 'Wipe Up-Right' },
+	{ id: 'wipe_up_left', label: 'Wipe Up-Left' },
+	{ id: 'wipe_down_right', label: 'Wipe Down-Right' },
+	{ id: 'wipe_down_left', label: 'Wipe Down-Left' },
+]
+
+const UNDERLYING_TYPE_CHOICES = [
+	{ id: 'cut', label: 'Cut' },
+	{ id: 'crossfade', label: 'Mix (crossfade)' },
+	...WIPE_PATTERN_CHOICES,
+]
+
+function setTransitionKeyProp(m2lx: M2LX, name: string, value: unknown): void {
+	m2lx.sendCSP({
+		command: 'set_key_property',
+		node: 'mixer',
+		args: { key_index: 0, key_type: 'transition', target: 'program', property: { name, value } },
+	})
+}
+
+// Ensure any active clip overlay is removed before a plain cut/mix/wipe take.
+function clearClipOverlay(m2lx: M2LX): void {
+	m2lx.sendCSP({ command: 'configure_effect', node: 'mixer', args: { animated: false } })
+	setTransitionKeyProp(m2lx, 'image', '')
+	setTransitionKeyProp(m2lx, 'translation', { x: 0, y: 0 })
+	setTransitionKeyProp(m2lx, 'scale', { x: 1, y: 1 })
+	setTransitionKeyProp(m2lx, 'rotation', 0)
+	setTransitionKeyProp(m2lx, 'shape', IDENTITY_SHAPE)
 }
 
 // DSKs appear on both buses and are mirrored. USKs are independent per bus.
@@ -81,7 +118,7 @@ export function UpdateActions(self: ModuleInstance): void {
 			},
 		},
 		cut: {
-			name: 'Cut',
+			name: 'Take: Cut',
 			options: [
 				{
 					id: 'flip_flop',
@@ -94,17 +131,33 @@ export function UpdateActions(self: ModuleInstance): void {
 			callback: async (event) => {
 				if (!self.m2lx) return
 				if (self.m2lx.trans_running) return
+				clearClipOverlay(self.m2lx)
+				self.m2lx.sendCSP({
+					command: 'configure_effect',
+					node: 'mixer',
+					args: { name: 'cut', args: { fade: 0 } },
+				})
 				self.m2lx.sendCSP({
 					command: 'configure_effect',
 					node: 'mixer',
 					args: { toggle_mode: !!event.options.flip_flop },
 				})
-				self.m2lx.sendCSP({ command: 'transition', node: 'mixer', args: { effect_enabled: false } })
+				self.m2lx.sendCSP({ command: 'transition', node: 'mixer', args: { effect_enabled: true } })
 			},
 		},
-		auto: {
-			name: 'Take / Auto',
+		mix: {
+			name: 'Take: Mix (crossfade)',
 			options: [
+				{
+					id: 'fade',
+					type: 'number',
+					label: 'Fade amount (0-1)',
+					default: 0.02,
+					min: 0,
+					max: 1,
+					step: 0.01,
+					tooltip: 'Crossfade softness; 0 is a hard swap, higher values ease in/out.',
+				},
 				{
 					id: 'flip_flop',
 					type: 'checkbox',
@@ -116,7 +169,13 @@ export function UpdateActions(self: ModuleInstance): void {
 			callback: async (event) => {
 				if (!self.m2lx) return
 				if (self.m2lx.trans_running) return
-				self.m2lx.trans_running = true // eager guard until status update confirms
+				self.m2lx.trans_running = true
+				clearClipOverlay(self.m2lx)
+				self.m2lx.sendCSP({
+					command: 'configure_effect',
+					node: 'mixer',
+					args: { name: 'crossfade', args: { fade: Number(event.options.fade) } },
+				})
 				self.m2lx.sendCSP({
 					command: 'configure_effect',
 					node: 'mixer',
@@ -126,16 +185,48 @@ export function UpdateActions(self: ModuleInstance): void {
 			},
 		},
 		wipe: {
-			name: 'Wipe (crossfade)',
-			options: [],
-			callback: async () => {
+			name: 'Take: Wipe',
+			options: [
+				{
+					id: 'pattern',
+					type: 'dropdown',
+					label: 'Wipe Pattern',
+					choices: WIPE_PATTERN_CHOICES,
+					default: 'wipe_right',
+					allowCustom: true,
+					tooltip: 'Choose a built-in pattern or type a custom name (e.g. "wipe_right").',
+				},
+				{
+					id: 'fade',
+					type: 'number',
+					label: 'Edge softness (0-1)',
+					default: 0.02,
+					min: 0,
+					max: 1,
+					step: 0.01,
+					tooltip: '0 = hard edge; higher values feather the wipe boundary.',
+				},
+				{
+					id: 'flip_flop',
+					type: 'checkbox',
+					label: 'Flip-Flop',
+					default: true,
+				},
+			],
+			callback: async (event) => {
 				if (!self.m2lx) return
 				if (self.m2lx.trans_running) return
 				self.m2lx.trans_running = true
+				clearClipOverlay(self.m2lx)
 				self.m2lx.sendCSP({
 					command: 'configure_effect',
 					node: 'mixer',
-					args: { name: 'crossfade', args: { fade: 0.02 } },
+					args: { name: String(event.options.pattern), args: { fade: Number(event.options.fade) } },
+				})
+				self.m2lx.sendCSP({
+					command: 'configure_effect',
+					node: 'mixer',
+					args: { toggle_mode: !!event.options.flip_flop },
 				})
 				self.m2lx.sendCSP({ command: 'transition', node: 'mixer', args: { effect_enabled: true } })
 			},
@@ -196,6 +287,92 @@ export function UpdateActions(self: ModuleInstance): void {
 					node: 'mixer',
 					args,
 				})
+			},
+		},
+		clip_transition: {
+			name: 'Take: Clip Transition',
+			options: [
+				{
+					id: 'clip',
+					type: 'textinput',
+					label: 'Clip path',
+					default: '',
+					useVariables: true,
+					tooltip:
+						'e.g. cliptrans/<uuid>.webp. Leave empty to clear the clip overlay (and take using the underlying type only).',
+				},
+				{
+					id: 'underlying',
+					type: 'dropdown',
+					label: 'Underlying transition type',
+					choices: UNDERLYING_TYPE_CHOICES,
+					default: 'cut',
+					tooltip: 'The transition played beneath the clip overlay.',
+				},
+				{
+					id: 'fade',
+					type: 'number',
+					label: 'Underlying fade/softness (0-1)',
+					default: 0,
+					min: 0,
+					max: 1,
+					step: 0.01,
+					tooltip: 'Ignored when underlying = Cut.',
+				},
+				{
+					id: 'flip_flop',
+					type: 'checkbox',
+					label: 'Flip-Flop',
+					default: true,
+				},
+			],
+			callback: async (event, context) => {
+				if (!self.m2lx) return
+				if (self.m2lx.trans_running) return
+				const clip = (await context.parseVariablesInString(String(event.options.clip))).trim()
+				const underlying = String(event.options.underlying)
+				const fade = Number(event.options.fade)
+				const m2lx = self.m2lx
+				const setProp = (name: string, value: unknown): void => {
+					m2lx.sendCSP({
+						command: 'set_key_property',
+						node: 'mixer',
+						args: { key_index: 0, key_type: 'transition', target: 'program', property: { name, value } },
+					})
+				}
+
+				// 1. Configure the clip overlay.
+				if (!clip) {
+					m2lx.sendCSP({ command: 'configure_effect', node: 'mixer', args: { animated: false } })
+					setProp('image', '')
+					setProp('translation', { x: 0, y: 0 })
+					setProp('scale', { x: 1, y: 1 })
+					setProp('rotation', 0)
+					setProp('shape', IDENTITY_SHAPE)
+				} else {
+					setProp('translation', { x: 0, y: 0 })
+					setProp('scale', { x: 1, y: 1 })
+					setProp('rotation', 0)
+					setProp('shape', IDENTITY_SHAPE)
+					setProp('image', clip)
+					m2lx.sendCSP({ command: 'configure_effect', node: 'mixer', args: { animated: true } })
+				}
+
+				// 2. Set the underlying transition type (cut uses fade=0).
+				m2lx.sendCSP({
+					command: 'configure_effect',
+					node: 'mixer',
+					args: { name: underlying, args: { fade: underlying === 'cut' ? 0 : fade } },
+				})
+
+				// 3. Take.
+				m2lx.trans_running = true
+				m2lx.sendCSP({
+					command: 'configure_effect',
+					node: 'mixer',
+					args: { toggle_mode: !!event.options.flip_flop },
+				})
+				m2lx.sendCSP({ command: 'transition', node: 'mixer', args: { effect_enabled: true } })
 			},
 		},
 		key: {

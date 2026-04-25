@@ -50,4 +50,20 @@ const migrateKeyerType: CompanionStaticUpgradeScript<ModuleConfig> = (_context, 
 	return { updatedConfig: null, updatedActions, updatedFeedbacks }
 }
 
-export const UpgradeScripts: CompanionStaticUpgradeScript<ModuleConfig>[] = [migrateWipeDuration, migrateKeyerType]
+// `auto` (Take/Auto) was renamed to `mix` and gained a `fade` option.
+const migrateAutoToMix: CompanionStaticUpgradeScript<ModuleConfig> = (_context, props) => {
+	const updatedActions: CompanionMigrationAction[] = []
+	for (const action of props.actions) {
+		if (action.actionId !== 'auto') continue
+		action.actionId = 'mix'
+		if (action.options && action.options.fade === undefined) action.options.fade = 0.02
+		updatedActions.push(action)
+	}
+	return { updatedConfig: null, updatedActions, updatedFeedbacks: [] }
+}
+
+export const UpgradeScripts: CompanionStaticUpgradeScript<ModuleConfig>[] = [
+	migrateWipeDuration,
+	migrateKeyerType,
+	migrateAutoToMix,
+]

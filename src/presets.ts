@@ -198,8 +198,12 @@ export function UpdatePresets(self: ModuleInstance): void {
 
 	// Transition controls.
 	presets.trans_cut = transitionPreset('Cut', 'CUT', 'cut', { flip_flop: true })
-	presets.trans_auto = transitionPreset('Auto', 'AUTO', 'auto', { flip_flop: true })
-	presets.trans_wipe = transitionPreset('Wipe (crossfade)', 'WIPE', 'wipe')
+	presets.trans_mix = transitionPreset('Mix', 'MIX', 'mix', { fade: 0.02, flip_flop: true })
+	presets.trans_wipe_right = transitionPreset('Wipe Right', 'WIPE →', 'wipe', {
+		pattern: 'wipe_right',
+		fade: 0.02,
+		flip_flop: true,
+	})
 	for (const d of ['0.5s', '1s', '1.5s']) {
 		presets[`trans_dur_${d.replace('.', '_')}`] = {
 			type: 'button',
